@@ -1,0 +1,9 @@
+*.pt
+*.ckpt
+*.pkl
+*.obj
+pretrained_models/
+mano_data/
+demo_out/
+__pycache__/
+*.pyc
