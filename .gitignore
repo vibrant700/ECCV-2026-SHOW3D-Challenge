@@ -7,3 +7,4 @@ mano_data/
 demo_out/
 __pycache__/
 *.pyc
+*.pth
