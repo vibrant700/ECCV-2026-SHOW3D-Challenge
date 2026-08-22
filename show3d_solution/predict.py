@@ -124,6 +124,10 @@ def main():
     ap.add_argument("--detector-pt", type=str,
                     default="/home/yixuan.wang/zhongmou.ji/WiLoR/pretrained_models/detector.pt")
     ap.add_argument("--out", type=str, default="predictions.jsonl")
+    ap.add_argument("--start", type=int, default=0,
+                    help="inclusive start index (for sharding across GPUs)")
+    ap.add_argument("--end", type=int, default=-1,
+                    help="exclusive end index; -1 = all")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -146,7 +150,8 @@ def main():
     )
 
     records = []
-    for idx in range(len(dataset)):
+    end = len(dataset) if args.end < 0 else args.end
+    for idx in range(args.start, min(end, len(dataset))):
         ex = dataset[idx]
         view = ex.views["headset0"]
         calib = view.calibration
@@ -187,18 +192,18 @@ def main():
         # rotate vectors to world (rotation only, translation cancels)
         field_world = field_cam @ R_wc.T  # (2,21,3) mm world
 
-        fields = {}
-        if has[0]:
-            fields["left_to_object"] = field_world[0].astype(np.float64)
-        if has[1]:
-            fields["right_to_object"] = field_world[1].astype(np.float64)
+        # Always predict BOTH hands (missing fields only lower recall).
+        fields = {
+            "left_to_object": field_world[0].astype(np.float64),
+            "right_to_object": field_world[1].astype(np.float64),
+        }
 
         records.append(PredictionRecord(
             sample_id=ex.sample.sample_id, fields=fields
         ))
 
         if idx % 500 == 0:
-            print(f"processed {idx}/{len(dataset)}")
+            print(f"processed {idx}/{len(dataset)}", flush=True)
 
     write_submission_jsonl(args.out, records)
     print(f"wrote {args.out} with {len(records)} frames")
