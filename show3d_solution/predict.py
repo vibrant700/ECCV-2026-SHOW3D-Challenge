@@ -58,7 +58,7 @@ def preprocess_image(image_rgb):
 class WiLoRJoints:
     """Run WiLoR detector + reconstructor, return per-hand 21 joints (camera m)."""
 
-    def __init__(self, wilor_ckpt, wilor_cfg, detector_pt, device):
+    def __init__(self, wilor_ckpt, wilor_cfg, detector_pt, device, finetuned=None):
         import os
         # WiLoR's load_wilor resolves './mano_data/...' relative to CWD, so
         # temporarily chdir into the WiLoR root while loading.
@@ -71,6 +71,12 @@ class WiLoRJoints:
             )
         finally:
             os.chdir(cwd)
+        if finetuned is not None:
+            ft = torch.load(finetuned, map_location="cpu")
+            if isinstance(ft, dict) and "model" in ft:
+                ft = ft["model"]
+            self.model.load_state_dict(ft)
+            print(f"loaded finetuned WiLoR weights from {finetuned}")
         self.model = self.model.to(device).eval()
         self.detector = YOLO(detector_pt).to(device)
         self.device = device
@@ -113,8 +119,10 @@ class WiLoRJoints:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root", type=str, required=True)
-    ap.add_argument("--manifest", type=str, required=True)
+    ap.add_argument("--root", type=str, default=None,
+                    help="data root (required unless --test-cache is used)")
+    ap.add_argument("--manifest", type=str, default=None,
+                    help="frame manifest (required unless --test-cache is used)")
     ap.add_argument("--checkpoint", type=str, required=True,
                     help="trained JointInterFieldModel checkpoint")
     ap.add_argument("--wilor-ckpt", type=str,
@@ -123,11 +131,15 @@ def main():
                     default="/home/yixuan.wang/zhongmou.ji/WiLoR/pretrained_models/model_config.yaml")
     ap.add_argument("--detector-pt", type=str,
                     default="/home/yixuan.wang/zhongmou.ji/WiLoR/pretrained_models/detector.pt")
+    ap.add_argument("--wilor-finetuned", type=str, default=None,
+                    help="optional finetuned WiLoR checkpoint (state_dict) to load")
     ap.add_argument("--out", type=str, default="predictions.jsonl")
     ap.add_argument("--start", type=int, default=0,
                     help="inclusive start index (for sharding across GPUs)")
     ap.add_argument("--end", type=int, default=-1,
                     help="exclusive end index; -1 = all")
+    ap.add_argument("--test-cache", type=str, default=None,
+                    help="test_cache.jsonl from extract_test.py (if set, skip MP4 decoding)")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -142,45 +154,69 @@ def main():
     model.load_state_dict(ckpt)
 
     # Load WiLoR
-    wilor = WiLoRJoints(args.wilor_ckpt, args.wilor_cfg, args.detector_pt, device)
+    wilor = WiLoRJoints(args.wilor_ckpt, args.wilor_cfg, args.detector_pt, device,
+                        finetuned=args.wilor_finetuned)
 
-    # Load test dataset (no labels)
-    dataset = Show3DInteractionFieldDataset(
-        args.root, args.manifest, load_labels=False, decode_images=True, multiview=False
-    )
+    # Load test data: from test_cache.jsonl if provided, else decode MP4s
+    use_cache = args.test_cache is not None
+    if use_cache:
+        test_samples = []
+        with open(args.test_cache) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    test_samples.append(json.loads(line))
+        data_len = len(test_samples)
+    else:
+        dataset = Show3DInteractionFieldDataset(
+            args.root, args.manifest, load_labels=False, decode_images=True, multiview=False
+        )
+        data_len = len(dataset)
 
     records = []
-    end = len(dataset) if args.end < 0 else args.end
-    for idx in range(args.start, min(end, len(dataset))):
-        ex = dataset[idx]
-        view = ex.views["headset0"]
-        calib = view.calibration
-        if calib is None or calib.t_world_from_camera is None:
-            # no valid extrinsic -> predict both hands anyway to keep recall (zeros)
-            records.append(PredictionRecord(
-                sample_id=ex.sample.sample_id,
-                fields={
-                    "left_to_object": np.zeros((21, 3), dtype=np.float64),
-                    "right_to_object": np.zeros((21, 3), dtype=np.float64),
-                },
-            ))
-            continue
-
-        R_wc = np.asarray(calib.t_world_from_camera[:3, :3], dtype=np.float64)
-
-        image_rgb = view.image  # (H,W,3) uint8 RGB
-        image_bgr = image_rgb[:, :, ::-1]  # RGB -> BGR for WiLoR/YOLO
+    end = data_len if args.end < 0 else args.end
+    for idx in range(args.start, min(end, data_len)):
+        if use_cache:
+            s = test_samples[idx]
+            sample_id = s["sample_id"]
+            if s["R_wc"] is None:
+                records.append(PredictionRecord(
+                    sample_id=sample_id,
+                    fields={
+                        "left_to_object": np.zeros((21, 3), dtype=np.float64),
+                        "right_to_object": np.zeros((21, 3), dtype=np.float64),
+                    },
+                ))
+                continue
+            R_wc = np.asarray(s["R_wc"], np.float64)
+            gray = cv2.imread(s["image"], cv2.IMREAD_GRAYSCALE)
+            image_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+            image_rgb = image_bgr[:, :, ::-1]  # grayscale replicated to 3ch
+        else:
+            ex = dataset[idx]
+            view = ex.views["headset0"]
+            calib = view.calibration
+            if calib is None or calib.t_world_from_camera is None:
+                records.append(PredictionRecord(
+                    sample_id=ex.sample.sample_id,
+                    fields={
+                        "left_to_object": np.zeros((21, 3), dtype=np.float64),
+                        "right_to_object": np.zeros((21, 3), dtype=np.float64),
+                    },
+                ))
+                continue
+            sample_id = ex.sample.sample_id
+            R_wc = np.asarray(calib.t_world_from_camera[:3, :3], dtype=np.float64)
+            image_rgb = view.image  # (H,W,3) uint8 RGB
+            image_bgr = image_rgb[:, :, ::-1]  # RGB -> BGR for WiLoR/YOLO
 
         # WiLoR joints (camera m) per detected hand
         joints_m, is_right = wilor(image_bgr)
 
-        # Build joints tensor: order [left, right], camera meters
         joints_cam = np.zeros((2, 21, 3), dtype=np.float32)
-        has = [False, False]
         for j_m, r in zip(joints_m, is_right):
             hand_idx = 1 if r else 0
             joints_cam[hand_idx] = j_m.astype(np.float32)
-            has[hand_idx] = True
 
         img = preprocess_image(image_rgb)
         img_t = torch.from_numpy(img).unsqueeze(0).to(device)
@@ -189,21 +225,17 @@ def main():
         with torch.no_grad():
             field_cam = model(img_t, joints_t)[0].cpu().numpy()  # (2,21,3) mm camera
 
-        # rotate vectors to world (rotation only, translation cancels)
         field_world = field_cam @ R_wc.T  # (2,21,3) mm world
 
-        # Always predict BOTH hands (missing fields only lower recall).
         fields = {
             "left_to_object": field_world[0].astype(np.float64),
             "right_to_object": field_world[1].astype(np.float64),
         }
 
-        records.append(PredictionRecord(
-            sample_id=ex.sample.sample_id, fields=fields
-        ))
+        records.append(PredictionRecord(sample_id=sample_id, fields=fields))
 
         if idx % 500 == 0:
-            print(f"processed {idx}/{len(dataset)}", flush=True)
+            print(f"processed {idx}/{data_len}", flush=True)
 
     write_submission_jsonl(args.out, records)
     print(f"wrote {args.out} with {len(records)} frames")
